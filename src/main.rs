@@ -5,11 +5,156 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use std::sync::mpsc::{Receiver, Sender};
 use std::io::{BufRead, Read};
+use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+mod fuzzydate;
+
+// TODO
+// get monitor size to set size of bar (x)
+
+pub struct Config {
+    fuzzy_time: bool,
+    datetime_format: String,
+    font: String,
+    font_size: f32,
+    bg_color: egui::Color32,
+    title_color: egui::Color32,
+    direction_color: egui::Color32,
+    paused_color: egui::Color32,
+    time_color: egui::Color32,
+    focused_ws_color: egui::Color32,
+    active_ws_color: egui::Color32,
+    inactive_ws_color: egui::Color32,
+}
+
+static CONFIG: OnceLock<Config> = OnceLock::new();
+
+const BAR_HEIGHT: f32 = 26.0;
+const BAR_PADDING_Y: f32 = 3.0;
+
+fn get_config() -> &'static Config {
+    CONFIG.get_or_init(|| {
+        Config {
+            fuzzy_time: true,
+            datetime_format: "%m/%d/%Y %H:%M".to_string(),
+            font: "Cascadia Code".to_string(),
+            font_size: 14.0,
+            bg_color: egui::Color32::from_rgb(15, 13, 14),
+            title_color: egui::Color32::from_rgb(136, 218, 242),
+            direction_color: egui::Color32::from_rgb(252, 186, 40),
+            paused_color: egui::Color32::from_rgb(252, 186, 40),
+            time_color: egui::Color32::from_rgb(252, 186, 40),
+            focused_ws_color: egui::Color32::from_rgb(247, 18, 255),
+            active_ws_color: egui::Color32::from_rgb(76, 67, 69),
+            inactive_ws_color: egui::Color32::from_rgb(76, 67, 69),
+        }
+    })
+}
+
+fn clamp_font_size(size: f32) -> f32 {
+    let max_size = (BAR_HEIGHT - (BAR_PADDING_Y * 2.0)).max(1.0);
+    size.min(max_size).max(1.0)
+}
+
+fn resolve_font_path(font: &str) -> Option<PathBuf> {
+    if font.trim().is_empty() {
+        return None;
+    }
+    let direct = Path::new(font);
+    if direct.is_file() {
+        return Some(direct.to_path_buf());
+    }
+    #[cfg(windows)]
+    {
+        let base = PathBuf::from(r"C:\Windows\Fonts");
+        let trimmed = font.trim();
+        let compact = trimmed.replace(' ', "");
+        let candidates = [
+            format!("{trimmed}.ttf"),
+            format!("{trimmed}.ttc"),
+            format!("{trimmed}.otf"),
+            format!("{compact}.ttf"),
+            format!("{compact}.ttc"),
+            format!("{compact}.otf"),
+        ];
+        for name in candidates {
+            let candidate = base.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn apply_theme(ctx: &egui::Context) {
+    let config = get_config();
+    let font_size = clamp_font_size(config.font_size);
+
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some(path) = resolve_font_path(&config.font) {
+        if let Ok(data) = std::fs::read(&path) {
+            let name = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("custom-font")
+                .to_string();
+            fonts
+                .font_data
+                .insert(name.clone(), egui::FontData::from_owned(data).into());
+            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                family.insert(0, name.clone());
+            }
+            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                family.insert(0, name.clone());
+            }
+        }
+    }
+    ctx.set_fonts(fonts);
+
+    let mut style = (*ctx.style()).clone();
+    let text_size = font_size;
+    let small_size = (font_size - 2.0).max(1.0);
+    style.text_styles = [
+        (
+            egui::TextStyle::Heading,
+            egui::FontId::new(text_size, egui::FontFamily::Proportional),
+        ),
+        (
+            egui::TextStyle::Body,
+            egui::FontId::new(text_size, egui::FontFamily::Proportional),
+        ),
+        (
+            egui::TextStyle::Monospace,
+            egui::FontId::new(text_size, egui::FontFamily::Monospace),
+        ),
+        (
+            egui::TextStyle::Button,
+            egui::FontId::new(text_size, egui::FontFamily::Proportional),
+        ),
+        (
+            egui::TextStyle::Small,
+            egui::FontId::new(small_size, egui::FontFamily::Proportional),
+        ),
+    ]
+    .into();
+    style.spacing.item_spacing.y = 0.0;
+    style.spacing.button_padding.y = 0.0;
+    ctx.set_style(style);
+
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = config.bg_color;
+    visuals.window_fill = config.bg_color;
+    visuals.faint_bg_color = config.bg_color;
+    ctx.set_visuals(visuals);
+}
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -18,8 +163,8 @@ fn main() -> eframe::Result<()> {
                 .with_taskbar(false)
                 .with_decorations(false)
                 .with_always_on_top()
-                .with_transparent(true)
-                .with_inner_size(eframe::egui::vec2(1920.0, 26.0))
+                .with_transparent(false)
+                .with_inner_size(eframe::egui::vec2(1920.0, BAR_HEIGHT))
                 .with_position(eframe::egui::pos2(0.0, 0.0))
         })),
         ..Default::default()
@@ -28,7 +173,9 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "rebar",
         options,
-        Box::new(|_cc| {
+        Box::new(|cc| {
+            apply_theme(&cc.egui_ctx);
+            
             let (tx, rx) = std::sync::mpsc::channel();
             spawn_ipc_thread(tx);
             Ok(Box::new(Rebar::new(rx)))
@@ -58,8 +205,10 @@ impl eframe::App for Rebar {
 impl Rebar {
     fn draw_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("rebar")
-            .exact_height(26.0)
+            .exact_height(BAR_HEIGHT)
             .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.spacing_mut().button_padding.y = 0.0;
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     self.draw_workspaces(ui);
@@ -81,36 +230,45 @@ impl Rebar {
 
 impl Rebar {
     fn draw_workspaces(&self, ui: &mut egui::Ui) {
+        let config = get_config();
         for ws in &self.state.workspaces {
             let color = match (ws.active, ws.focused) {
-                (true, true) => egui::Color32::WHITE,
-                (true, false) => egui::Color32::GRAY,
-                (false, _) => egui::Color32::DARK_GRAY,
+                (true, true) => config.focused_ws_color,
+                (true, false) => config.active_ws_color,
+                (false, _) => config.inactive_ws_color,
             };
             ui.colored_label(color, ws.icon.clone());
         }
     }
 
     fn draw_focused_title(&self, ui: &mut egui::Ui) {
-        ui.label(self.state.focused_title.clone());
+        let config = get_config();
+        ui.colored_label(config.title_color, self.state.focused_title.clone());
     }
 
     fn draw_time(&self, ui: &mut egui::Ui) {
-        ui.label(self.state.time.clone());
+        let config = get_config();
+        ui.colored_label(config.time_color, self.state.time.clone());
     }
 
     fn draw_status_indicators(&self, ui: &mut egui::Ui) {
-        ui.label(if self.state.horizontal { "[--]" } else { "[||]" });
+        let config = get_config();
+        ui.colored_label(config.direction_color, if self.state.horizontal { "H" } else { "V" });
         ui.separator();
-        ui.label(if self.state.paused { "[PAUSED]" } else { "" });
+        ui.colored_label(config.paused_color, if self.state.paused { "PAUSED" } else { "" });
     }
 }
 
 impl Rebar {
     fn update_time(&mut self) {
+        let config = get_config();
         let now = Instant::now();
         if now.duration_since(self.state.last_tick) >= Duration::from_secs(60) {
-            self.state.time = chrono::Local::now().format("%d/%m/%Y %H:%M").to_string();
+            if config.fuzzy_time {
+                self.state.time = fuzzydate::get_fuzzy_date();
+            } else {
+                self.state.time = chrono::Local::now().format(&config.datetime_format).to_string();
+            }
             self.state.last_tick = now;
         }
     }
@@ -147,7 +305,7 @@ impl Default for RebarState {
             focused_title: "GlazeWM - Rebar".to_string(),
             paused: false,
             horizontal: true,
-            time: chrono::Local::now().format("%d/%m/%Y %H:%M").to_string(),
+            time: chrono::Local::now().format("%m/%d/%Y %H:%M").to_string(),
             last_tick: Instant::now(),
         }
     }
